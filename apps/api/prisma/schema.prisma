@@ -151,21 +151,23 @@ model Annotation {
 }
 
 model RereadMark {
-  id         String    @id @default(uuid()) @db.Uuid
-  userId     String    @map("user_id") @db.Uuid
-  bookId     String    @map("book_id") @db.Uuid
-  version    Int       @default(1)
-  pageNumber Int       @map("page_number")
-  reason     String?   @db.VarChar(1000)
-  createdAt  DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
-  updatedAt  DateTime  @updatedAt @map("updated_at") @db.Timestamptz(3)
-  deletedAt  DateTime? @map("deleted_at") @db.Timestamptz(3)
+  id          String    @id @default(uuid()) @db.Uuid
+  userId      String    @map("user_id") @db.Uuid
+  bookId      String    @map("book_id") @db.Uuid
+  version     Int       @default(1)
+  pageNumber  Int       @map("page_number")
+  rereadRound Int       @default(1) @map("reread_round")
+  reason      String?   @db.VarChar(1000)
+  createdAt   DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt   DateTime  @updatedAt @map("updated_at") @db.Timestamptz(3)
+  deletedAt   DateTime? @map("deleted_at") @db.Timestamptz(3)
 
   user User @relation(fields: [userId], references: [id], onDelete: Restrict)
   book Book @relation(fields: [bookId], references: [id], onDelete: Restrict)
 
   @@index([userId, deletedAt, createdAt])
   @@index([bookId, pageNumber, deletedAt])
+  @@index([bookId, pageNumber, rereadRound, deletedAt])
   @@map("reread_marks")
 }
 

@@ -61,6 +61,7 @@ export interface RereadMark {
   bookId: string;
   type: 'REREAD_MARK';
   pageNumber: number;
+  rereadRound: number;
   reason: string | null;
   version: number;
   createdAt: string;
@@ -97,6 +98,12 @@ export interface Pagination {
   page: number;
   pageSize: number;
   total: number;
+}
+
+export interface TracePage {
+  pageSize: number;
+  hasMore: boolean;
+  nextCursor: string | null;
 }
 
 export const MOOD_LABELS: Record<MoodTag, string> = {

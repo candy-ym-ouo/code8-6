@@ -20,6 +20,7 @@ import {
   type TraceType
 } from '../types/domain';
 import { timelineApi } from '../api';
+import { groupRereadMarks, type RereadReasonFilter } from '../lib/rereads';
 
 type DeletedItem = { kind: 'DOG_EAR' | 'ANNOTATION' | 'REREAD_MARK' | 'REFLECTION'; id: string; label: string };
 type ReflectionEdit = { id: string; version: number; moodTags: MoodTag[]; text: string };
@@ -53,6 +54,10 @@ const completeForm = reactive({
   moodTags: [] as MoodTag[],
   text: ''
 });
+const rereadFilter = reactive({
+  reason: 'ALL' as RereadReasonFilter,
+  keyword: ''
+});
 
 const tabs = computed(() => [
   { value: 'PAGES' as const, label: '按页' },
@@ -67,6 +72,19 @@ const visibleTraces = computed(() => {
   const filtered = activeTab.value === 'PAGES' ? traces.value : traces.value.filter((trace) => trace.type === activeTab.value);
   return [...filtered].sort((a, b) => tracePage(a) - tracePage(b) || b.createdAt.localeCompare(a.createdAt));
 });
+
+const rereadGroups = computed(() =>
+  groupRereadMarks(traces.value, { reasonFilter: rereadFilter.reason, keyword: rereadFilter.keyword })
+);
+
+const rereadCount = computed(() =>
+  traces.value.reduce((count, trace) => (trace.type === 'REREAD_MARK' ? count + 1 : count), 0)
+);
+
+function resetRereadFilter(): void {
+  rereadFilter.reason = 'ALL';
+  rereadFilter.keyword = '';
+}
 
 const statusActions = computed(() => {
   if (!book.value) return [];
@@ -104,15 +122,15 @@ function canEditReflection(reflection: Reflection): boolean {
 
 async function loadAllTraces(id: string): Promise<Trace[]> {
   const all: Trace[] = [];
-  let page = 1;
-  let total = 0;
-  do {
-    const params = new URLSearchParams({ page: String(page), pageSize: '100' });
+  let cursor: string | null = null;
+  for (let round = 0; round < 1000; round += 1) {
+    const params = new URLSearchParams({ pageSize: '100' });
+    if (cursor) params.set('cursor', cursor);
     const result = await booksApi.traces(id, params);
     all.push(...result.items);
-    total = result.pagination.total;
-    page += 1;
-  } while (all.length < total && page <= 100);
+    if (!result.page.hasMore || !result.page.nextCursor) break;
+    cursor = result.page.nextCursor;
+  }
   return all;
 }
 
@@ -355,7 +373,9 @@ async function deleteBook(): Promise<void> {
 }
 
 function eventSummary(payload: Record<string, unknown>): string {
-  if (typeof payload.pageNumber === 'number') return `第 ${payload.pageNumber} 页`;
+  const roundText =
+    typeof payload.rereadRound === 'number' ? `（第 ${payload.rereadRound} 次重读）` : '';
+  if (typeof payload.pageNumber === 'number') return `第 ${payload.pageNumber} 页${roundText}`;
   if (typeof payload.startPage === 'number') {
     const end = typeof payload.endPage === 'number' ? payload.endPage : payload.startPage;
     return `第 ${payload.startPage}–${end} 页`;
@@ -532,12 +552,54 @@ onMounted(load);
         <p v-if="activities.length === 0" class="empty-inline">这本书还没有变化记录。</p>
       </div>
 
+      <div v-else-if="activeTab === 'REREAD_MARK'" class="trace-list">
+        <form class="inline-filter" @submit.prevent>
+          <fieldset class="filter-group">
+            <legend class="muted">原因</legend>
+            <label><input v-model="rereadFilter.reason" type="radio" value="ALL" /> 全部</label>
+            <label><input v-model="rereadFilter.reason" type="radio" value="WITH_REASON" /> 写了原因</label>
+            <label><input v-model="rereadFilter.reason" type="radio" value="WITHOUT_REASON" /> 没写原因</label>
+          </fieldset>
+          <label class="grow">
+            搜索原因
+            <input v-model="rereadFilter.keyword" type="search" placeholder="只在重读原因里查找" />
+          </label>
+          <button class="button button-quiet" type="button" @click="resetRereadFilter">清除筛选</button>
+        </form>
+
+        <article v-for="group in rereadGroups" :key="group.pageNumber" class="trace-card reread-group">
+          <div class="trace-card-heading">
+            <div>
+              <span class="trace-type">第 {{ group.pageNumber }} 页</span>
+              <strong>重读 {{ group.marks.length }} 次</strong>
+            </div>
+          </div>
+          <ol class="reread-rounds">
+            <li v-for="mark in group.marks" :key="mark.id" class="reread-round">
+              <div class="reread-round-heading">
+                <span class="round-badge">第 {{ mark.rereadRound }} 次重读</span>
+                <div class="button-row">
+                  <button class="text-button" type="button" @click="openEdit(mark)">编辑</button>
+                  <button class="text-button danger-text" type="button" @click="deleteTrace(mark)">删除</button>
+                </div>
+              </div>
+              <p class="preserve-text">{{ mark.reason || '未填写原因' }}</p>
+              <p class="muted">创建 {{ formatDateTime(mark.createdAt) }} · 更新 {{ formatDateTime(mark.updatedAt) }}</p>
+            </li>
+          </ol>
+        </article>
+        <p v-if="rereadGroups.length === 0" class="empty-inline">
+          {{ rereadCount === 0 ? '这个分类还没有留下痕迹。' : '没有符合筛选条件的重读记录。' }}
+        </p>
+      </div>
+
       <div v-else class="trace-list">
         <article v-for="trace in visibleTraces" :key="`${trace.type}-${trace.id}`" class="trace-card">
           <div class="trace-card-heading">
             <div>
               <span class="trace-type">{{ TRACE_LABELS[trace.type] }}</span>
               <strong>{{ traceRange(trace) }}</strong>
+              <span v-if="trace.type === 'REREAD_MARK'" class="round-badge">第 {{ trace.rereadRound }} 次重读</span>
             </div>
             <div class="button-row">
               <button class="text-button" type="button" @click="openEdit(trace)">编辑</button>

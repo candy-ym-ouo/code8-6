@@ -10,6 +10,7 @@ import type {
   RereadMark,
   TimelineEvent,
   Trace,
+  TracePage,
   User
 } from '../types/domain';
 
@@ -46,7 +47,7 @@ export const booksApi = {
   ) => api.patch<{ book: Book; reflection?: Reflection }>(`/books/${id}/status`, body),
   delete: (id: string, version: number) => api.delete<void>(`/books/${id}`, { version }),
   traces: (id: string, params: URLSearchParams) =>
-    api.get<{ items: Trace[]; pagination: Pagination }>(`/books/${id}/traces?${params}`),
+    api.get<{ items: Trace[]; page: TracePage }>(`/books/${id}/traces?${params}`),
   reflections: (id: string) => api.get<{ items: Reflection[] }>(`/books/${id}/reflections`)
 };
 

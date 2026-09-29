@@ -7,7 +7,8 @@ import { AppError, zodFields } from '../../lib/errors.js';
 import { currentUser, requireAuth } from '../../lib/auth.js';
 import { isRestoreWindowOpen, normalizeText, validatePageRange, validateSinglePage } from '../../lib/domain.js';
 import { writeEvent } from '../../lib/events.js';
-import { optionalDate, paginationFromQuery, parseId } from '../../lib/http.js';
+import { optionalDate, parseId } from '../../lib/http.js';
+import { decodeTraceCursor, encodeTraceCursor, type TraceCursor } from '../../lib/cursor.js';
 
 const optionalReason = (max: number) =>
   z.preprocess(
@@ -94,6 +95,7 @@ function serializeRereadMark(item: {
   bookId: string;
   version: number;
   pageNumber: number;
+  rereadRound: number;
   reason: string | null;
   createdAt: Date;
   updatedAt: Date;
@@ -130,14 +132,39 @@ export const traceRoutes: FastifyPluginAsync = async (app) => {
       throw new AppError(422, 'VALIDATION_ERROR', '页码无效');
     }
     const keyword = typeof query.keyword === 'string' ? query.keyword.trim() : '';
+    const rereadOnly = String(query.rereadOnly ?? '').toLowerCase();
+    if (rereadOnly && rereadOnly !== 'true' && rereadOnly !== 'false') {
+      throw new AppError(422, 'VALIDATION_ERROR', '重读筛选参数无效');
+    }
+    const hasReason = rereadOnly === 'true';
+    const rereadRound = query.rereadRound === undefined ? undefined : Number(query.rereadRound);
+    if (rereadRound !== undefined && (!Number.isInteger(rereadRound) || rereadRound < 1)) {
+      throw new AppError(422, 'VALIDATION_ERROR', '重读轮次无效');
+    }
+    if ((hasReason || rereadRound !== undefined) && type && type !== 'REREAD_MARK') {
+      throw new AppError(422, 'VALIDATION_ERROR', '重读筛选只能用于重读页');
+    }
     const from = optionalDate(query.from, 'from');
     const to = optionalDate(query.to, 'to');
     const dateFilter = {
       ...(from ? { gte: from } : {}),
       ...(to ? { lte: to } : {})
     };
-    const { page, pageSize } = paginationFromQuery(request);
+    const rawPageSize = Number(query.pageSize ?? 50);
+    const pageSize = Number.isInteger(rawPageSize) && rawPageSize > 0 ? Math.min(rawPageSize, 100) : 50;
+    const cursor = decodeTraceCursor(query.cursor);
+    const cursorFilter = cursor
+      ? {
+          OR: [
+            { createdAt: { lt: new Date(cursor.createdAtValue) } },
+            { createdAt: new Date(cursor.createdAtValue), id: { lt: cursor.id } }
+          ]
+        }
+      : {};
+    const orderBy = [{ createdAt: 'desc' as const }, { id: 'asc' as const }];
 
+    // 取 pageSize + 1 用于判断是否还有后续；三个表的排序键一致，归并后再截断，
+    // 保证跨表游标分页不漏项、不重项。
     const [dogEars, annotations, rereadMarks] = await Promise.all([
       !type || type === 'DOG_EAR'
         ? prisma.dogEar.findMany({
@@ -147,9 +174,11 @@ export const traceRoutes: FastifyPluginAsync = async (app) => {
               deletedAt: null,
               ...(pageNumber ? { pageNumber } : {}),
               ...(keyword ? { reason: { contains: keyword, mode: 'insensitive' } } : {}),
-              ...(from || to ? { createdAt: dateFilter } : {})
+              ...(from || to ? { createdAt: dateFilter } : {}),
+              ...cursorFilter
             },
-            orderBy: { createdAt: 'desc' }
+            orderBy,
+            take: pageSize + 1
           })
         : [],
       !type || type === 'ANNOTATION'
@@ -160,9 +189,11 @@ export const traceRoutes: FastifyPluginAsync = async (app) => {
               deletedAt: null,
               ...(pageNumber ? { startPage: { lte: pageNumber }, endPage: { gte: pageNumber } } : {}),
               ...(keyword ? { content: { contains: keyword, mode: 'insensitive' } } : {}),
-              ...(from || to ? { createdAt: dateFilter } : {})
+              ...(from || to ? { createdAt: dateFilter } : {}),
+              ...cursorFilter
             },
-            orderBy: { createdAt: 'desc' }
+            orderBy,
+            take: pageSize + 1
           })
         : [],
       !type || type === 'REREAD_MARK'
@@ -172,10 +203,21 @@ export const traceRoutes: FastifyPluginAsync = async (app) => {
               bookId,
               deletedAt: null,
               ...(pageNumber ? { pageNumber } : {}),
-              ...(keyword ? { reason: { contains: keyword, mode: 'insensitive' } } : {}),
-              ...(from || to ? { createdAt: dateFilter } : {})
+              ...(rereadRound !== undefined ? { rereadRound } : {}),
+              ...(keyword || rereadOnly
+                ? {
+                    reason: {
+                      ...(keyword ? { contains: keyword, mode: 'insensitive' as const } : {}),
+                      ...(rereadOnly === 'true' ? { not: null } : {}),
+                      ...(rereadOnly === 'false' ? { equals: null } : {})
+                    }
+                  }
+                : {}),
+              ...(from || to ? { createdAt: dateFilter } : {}),
+              ...cursorFilter
             },
-            orderBy: { createdAt: 'desc' }
+            orderBy,
+            take: pageSize + 1
           })
         : []
     ]);
@@ -184,10 +226,18 @@ export const traceRoutes: FastifyPluginAsync = async (app) => {
       ...dogEars.map(serializeDogEar),
       ...annotations.map(serializeAnnotation),
       ...rereadMarks.map(serializeRereadMark)
-    ].sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime());
-    const total = merged.length;
-    const items = merged.slice((page - 1) * pageSize, page * pageSize);
-    return { items, pagination: { page, pageSize, total } };
+    ].sort(
+      (a, b) =>
+        b.createdAt.getTime() - a.createdAt.getTime() ||
+        (a.id < b.id ? -1 : a.id > b.id ? 1 : 0)
+    );
+    const items = merged.slice(0, pageSize);
+    const hasMore = merged.length > pageSize;
+    const last = items[items.length - 1];
+    const nextCursor: string | undefined = hasMore && last
+      ? encodeTraceCursor({ createdAtValue: last.createdAt.getTime(), id: last.id } satisfies TraceCursor)
+      : undefined;
+    return { items, page: { pageSize, hasMore, nextCursor } };
   });
 
   app.post('/books/:bookId/dog-ears', async (request, reply) => {
@@ -469,11 +519,24 @@ export const traceRoutes: FastifyPluginAsync = async (app) => {
     if (!book) throw new AppError(404, 'NOT_FOUND', '书目不存在');
     validateSinglePage(parsed.data.pageNumber, book.pageCount);
     const mark = await prisma.$transaction(async (tx) => {
+      // 以 (书目, 页码) 为粒度串行化轮次分配，并发提交也能得到连续、不撞号的轮次。
+      const lockRows = await tx.$queryRaw<{ lockKey: bigint }[]>`
+        SELECT hashtextextended(
+          ${bookId}::text || ':' || ${parsed.data.pageNumber}::text, 0
+        ) AS "lockKey"
+      `;
+      await tx.$executeRaw`SELECT pg_advisory_xact_lock(${lockRows[0]!.lockKey})`;
+      const latest = await tx.rereadMark.aggregate({
+        where: { bookId, pageNumber: parsed.data.pageNumber },
+        _max: { rereadRound: true }
+      });
+      const rereadRound = (latest._max.rereadRound ?? 0) + 1;
       const created = await tx.rereadMark.create({
         data: {
           userId,
           bookId,
           pageNumber: parsed.data.pageNumber,
+          rereadRound,
           reason: parsed.data.reason ? normalizeText(parsed.data.reason) : null
         }
       });
@@ -483,7 +546,11 @@ export const traceRoutes: FastifyPluginAsync = async (app) => {
         entityType: 'REREAD_MARK',
         entityId: created.id,
         action: 'CREATED',
-        payload: { pageNumber: created.pageNumber, reason: eventSummary(created.reason) }
+        payload: {
+          pageNumber: created.pageNumber,
+          rereadRound,
+          reason: eventSummary(created.reason)
+        }
       });
       return created;
     });
@@ -510,9 +577,27 @@ export const traceRoutes: FastifyPluginAsync = async (app) => {
           ? normalizeText(parsed.data.reason)
           : null;
     const updated = await prisma.$transaction(async (tx) => {
+      const lockRows = await tx.$queryRaw<{ lockKey: bigint }[]>`
+        SELECT hashtextextended(
+          ${existing.bookId}::text || ':' || ${pageNumber}::text, 0
+        ) AS "lockKey"
+      `;
+      await tx.$executeRaw`SELECT pg_advisory_xact_lock(${lockRows[0]!.lockKey})`;
+      let rereadRound = existing.rereadRound;
+      if (pageNumber !== existing.pageNumber) {
+        const latest = await tx.rereadMark.aggregate({
+          where: {
+            bookId: existing.bookId,
+            pageNumber,
+            id: { not: id }
+          },
+          _max: { rereadRound: true }
+        });
+        rereadRound = (latest._max.rereadRound ?? 0) + 1;
+      }
       const result = await tx.rereadMark.updateMany({
         where: { id, userId, deletedAt: null, version: existing.version },
-        data: { pageNumber, reason, version: { increment: 1 } }
+        data: { pageNumber, rereadRound, reason, version: { increment: 1 } }
       });
       if (result.count !== 1) throw new AppError(409, 'STALE_WRITE', '重读记录已在其他位置被修改');
       await writeEvent(tx, {
@@ -521,7 +606,7 @@ export const traceRoutes: FastifyPluginAsync = async (app) => {
         entityType: 'REREAD_MARK',
         entityId: id,
         action: 'UPDATED',
-        payload: { pageNumber, reason: eventSummary(reason) }
+        payload: { pageNumber, rereadRound, reason: eventSummary(reason) }
       });
       return tx.rereadMark.findUniqueOrThrow({ where: { id } });
     });
@@ -548,7 +633,7 @@ export const traceRoutes: FastifyPluginAsync = async (app) => {
         entityType: 'REREAD_MARK',
         entityId: id,
         action: 'DELETED',
-        payload: { pageNumber: existing.pageNumber }
+        payload: { pageNumber: existing.pageNumber, rereadRound: existing.rereadRound }
       });
     });
     return reply.status(204).send();
@@ -574,7 +659,7 @@ export const traceRoutes: FastifyPluginAsync = async (app) => {
         entityType: 'REREAD_MARK',
         entityId: id,
         action: 'RESTORED',
-        payload: { pageNumber: value.pageNumber }
+        payload: { pageNumber: value.pageNumber, rereadRound: value.rereadRound }
       });
       return value;
     });
