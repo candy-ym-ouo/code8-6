@@ -61,6 +61,7 @@ export interface RereadMark {
   bookId: string;
   type: 'REREAD_MARK';
   pageNumber: number;
+  roundWithinPage: number;
   reason: string | null;
   version: number;
   createdAt: string;

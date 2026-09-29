@@ -94,11 +94,31 @@ function serializeRereadMark(item: {
   bookId: string;
   version: number;
   pageNumber: number;
+  roundWithinPage: number;
   reason: string | null;
   createdAt: Date;
   updatedAt: Date;
 }) {
   return { ...item, type: 'REREAD_MARK' as const };
+}
+
+/**
+ * 在事务内为指定页分配下一个页内轮次（只统计未删除记录）。
+ * 先取与“书 + 页码”绑定的事务级咨询锁，避免并发事务同时读到相同最大值而撞号；
+ * 数据库另有部分唯一索引兜底。锁随事务提交/回放自动释放。
+ */
+async function nextRereadRound(
+  tx: Prisma.TransactionClient,
+  bookId: string,
+  pageNumber: number
+): Promise<number> {
+  // 用书 UUID 的 64 位文本哈希与页码组合成稳定的咨询锁键，同一页的并发写会串行化。
+  await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${bookId}::text, 0) + ${pageNumber})`;
+  const latest = await tx.rereadMark.aggregate({
+    where: { bookId, pageNumber, deletedAt: null },
+    _max: { roundWithinPage: true }
+  });
+  return (latest._max.roundWithinPage ?? 0) + 1;
 }
 
 function assertVersion(current: number, requested?: number): void {
@@ -130,11 +150,20 @@ export const traceRoutes: FastifyPluginAsync = async (app) => {
       throw new AppError(422, 'VALIDATION_ERROR', '页码无效');
     }
     const keyword = typeof query.keyword === 'string' ? query.keyword.trim() : '';
+    const reason = typeof query.reason === 'string' ? query.reason.trim() : '';
+    const hasReason =
+      query.hasReason === 'true' ? true : query.hasReason === 'false' ? false : undefined;
     const from = optionalDate(query.from, 'from');
     const to = optionalDate(query.to, 'to');
     const dateFilter = {
       ...(from ? { gte: from } : {}),
       ...(to ? { lte: to } : {})
+    };
+    // 折角与重读页都用 reason 记录原因；空串/精确匹配与“是否填写原因”都在这里统一。
+    const reasonFilter = {
+      ...(reason ? { reason } : {}),
+      ...(hasReason === true ? { NOT: { reason: null } } : {}),
+      ...(hasReason === false ? { reason: null } : {})
     };
     const { page, pageSize } = paginationFromQuery(request);
 
@@ -147,9 +176,10 @@ export const traceRoutes: FastifyPluginAsync = async (app) => {
               deletedAt: null,
               ...(pageNumber ? { pageNumber } : {}),
               ...(keyword ? { reason: { contains: keyword, mode: 'insensitive' } } : {}),
+              ...(reason || hasReason !== undefined ? reasonFilter : {}),
               ...(from || to ? { createdAt: dateFilter } : {})
             },
-            orderBy: { createdAt: 'desc' }
+            orderBy: [{ createdAt: 'desc' }, { id: 'desc' }]
           })
         : [],
       !type || type === 'ANNOTATION'
@@ -162,7 +192,7 @@ export const traceRoutes: FastifyPluginAsync = async (app) => {
               ...(keyword ? { content: { contains: keyword, mode: 'insensitive' } } : {}),
               ...(from || to ? { createdAt: dateFilter } : {})
             },
-            orderBy: { createdAt: 'desc' }
+            orderBy: [{ createdAt: 'desc' }, { id: 'desc' }]
           })
         : [],
       !type || type === 'REREAD_MARK'
@@ -173,18 +203,23 @@ export const traceRoutes: FastifyPluginAsync = async (app) => {
               deletedAt: null,
               ...(pageNumber ? { pageNumber } : {}),
               ...(keyword ? { reason: { contains: keyword, mode: 'insensitive' } } : {}),
+              ...(reason || hasReason !== undefined ? reasonFilter : {}),
               ...(from || to ? { createdAt: dateFilter } : {})
             },
-            orderBy: { createdAt: 'desc' }
+            orderBy: [{ createdAt: 'desc' }, { id: 'desc' }]
           })
         : []
     ]);
 
+    // 统一按创建时间倒序合并，时间相同时用 id 兜底：跨类型比较保持可传递，
+    // 偏移分页在新增/删除后顺序稳定。重读的“页内轮次”顺序由前端聚合处理。
     const merged = [
       ...dogEars.map(serializeDogEar),
       ...annotations.map(serializeAnnotation),
       ...rereadMarks.map(serializeRereadMark)
-    ].sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime());
+    ].sort(
+      (a, b) => b.createdAt.getTime() - a.createdAt.getTime() || (a.id < b.id ? 1 : a.id > b.id ? -1 : 0)
+    );
     const total = merged.length;
     const items = merged.slice((page - 1) * pageSize, page * pageSize);
     return { items, pagination: { page, pageSize, total } };
@@ -469,11 +504,13 @@ export const traceRoutes: FastifyPluginAsync = async (app) => {
     if (!book) throw new AppError(404, 'NOT_FOUND', '书目不存在');
     validateSinglePage(parsed.data.pageNumber, book.pageCount);
     const mark = await prisma.$transaction(async (tx) => {
+      const roundWithinPage = await nextRereadRound(tx, bookId, parsed.data.pageNumber);
       const created = await tx.rereadMark.create({
         data: {
           userId,
           bookId,
           pageNumber: parsed.data.pageNumber,
+          roundWithinPage,
           reason: parsed.data.reason ? normalizeText(parsed.data.reason) : null
         }
       });
@@ -483,7 +520,11 @@ export const traceRoutes: FastifyPluginAsync = async (app) => {
         entityType: 'REREAD_MARK',
         entityId: created.id,
         action: 'CREATED',
-        payload: { pageNumber: created.pageNumber, reason: eventSummary(created.reason) }
+        payload: {
+          pageNumber: created.pageNumber,
+          roundWithinPage,
+          reason: eventSummary(created.reason)
+        }
       });
       return created;
     });
@@ -509,10 +550,16 @@ export const traceRoutes: FastifyPluginAsync = async (app) => {
         : parsed.data.reason
           ? normalizeText(parsed.data.reason)
           : null;
+    const movedToPage = pageNumber !== existing.pageNumber;
     const updated = await prisma.$transaction(async (tx) => {
+      // 跨页移动意味着在新的一页“补记”一次重读，领取该页的下一个轮次；
+      // 留在原页则保留历史轮次，避免编辑原因改动先后顺序。
+      const roundWithinPage = movedToPage
+        ? await nextRereadRound(tx, existing.bookId, pageNumber)
+        : existing.roundWithinPage;
       const result = await tx.rereadMark.updateMany({
         where: { id, userId, deletedAt: null, version: existing.version },
-        data: { pageNumber, reason, version: { increment: 1 } }
+        data: { pageNumber, roundWithinPage, reason, version: { increment: 1 } }
       });
       if (result.count !== 1) throw new AppError(409, 'STALE_WRITE', '重读记录已在其他位置被修改');
       await writeEvent(tx, {
@@ -521,7 +568,7 @@ export const traceRoutes: FastifyPluginAsync = async (app) => {
         entityType: 'REREAD_MARK',
         entityId: id,
         action: 'UPDATED',
-        payload: { pageNumber, reason: eventSummary(reason) }
+        payload: { pageNumber, roundWithinPage, reason: eventSummary(reason) }
       });
       return tx.rereadMark.findUniqueOrThrow({ where: { id } });
     });
@@ -564,9 +611,12 @@ export const traceRoutes: FastifyPluginAsync = async (app) => {
     }
     if (existing.book.deletedAt) throw new AppError(409, 'BOOK_DELETED', '所属书目已删除');
     const restored = await prisma.$transaction(async (tx) => {
+      // 删除期间该页可能又产生了新的重读；恢复时把这条重新追加为最新轮次，
+      // 保证页内轮次不撞号、先后顺序唯一。
+      const roundWithinPage = await nextRereadRound(tx, existing.bookId, existing.pageNumber);
       const value = await tx.rereadMark.update({
         where: { id },
-        data: { deletedAt: null, version: { increment: 1 } }
+        data: { deletedAt: null, roundWithinPage, version: { increment: 1 } }
       });
       await writeEvent(tx, {
         userId,
@@ -574,7 +624,7 @@ export const traceRoutes: FastifyPluginAsync = async (app) => {
         entityType: 'REREAD_MARK',
         entityId: id,
         action: 'RESTORED',
-        payload: { pageNumber: value.pageNumber }
+        payload: { pageNumber: value.pageNumber, roundWithinPage }
       });
       return value;
     });

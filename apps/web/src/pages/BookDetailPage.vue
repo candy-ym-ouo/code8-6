@@ -16,10 +16,18 @@ import {
   type BookStatus,
   type MoodTag,
   type Reflection,
+  type RereadMark,
   type Trace,
   type TraceType
 } from '../types/domain';
 import { timelineApi } from '../api';
+import {
+  aggregateRereadMarks,
+  distinctRereadReasons,
+  EMPTY_REASON,
+  fetchAllPages,
+  filterRereadGroups
+} from '../lib/traces';
 
 type DeletedItem = { kind: 'DOG_EAR' | 'ANNOTATION' | 'REREAD_MARK' | 'REFLECTION'; id: string; label: string };
 type ReflectionEdit = { id: string; version: number; moodTags: MoodTag[]; text: string };
@@ -39,6 +47,7 @@ const success = ref('');
 const activeTab = ref<'PAGES' | TraceType | 'REFLECTIONS' | 'TIMELINE'>('PAGES');
 const createType = ref<TraceType | null>(null);
 const editing = ref<Trace | null>(null);
+const rereadReasonFilter = ref('');
 const showCompleteForm = ref(false);
 const reflectionEdit = ref<ReflectionEdit | null>(null);
 const lastDeleted = ref<DeletedItem | null>(null);
@@ -63,8 +72,28 @@ const tabs = computed(() => [
   { value: 'TIMELINE' as const, label: '本书时间线' }
 ]);
 
+const rereadMarks = computed<RereadMark[]>(() =>
+  traces.value.filter((trace): trace is RereadMark => trace.type === 'REREAD_MARK')
+);
+
+const rereadReasonOptions = computed(() => distinctRereadReasons(rereadMarks.value));
+
+const hasEmptyRereadReason = computed(() => rereadMarks.value.some((mark) => !mark.reason));
+
+// 轮次取后端页内序号按页聚合，再叠加原因筛选，筛选与全量视图的编号一致。
+const rereadGroups = computed(() =>
+  filterRereadGroups(aggregateRereadMarks(rereadMarks.value), rereadReasonFilter.value)
+);
+
+const filteredRereadCount = computed(() =>
+  rereadGroups.value.reduce((sum, group) => sum + group.marks.length, 0)
+);
+
 const visibleTraces = computed(() => {
-  const filtered = activeTab.value === 'PAGES' ? traces.value : traces.value.filter((trace) => trace.type === activeTab.value);
+  const filtered =
+    activeTab.value === 'PAGES'
+      ? traces.value
+      : traces.value.filter((trace) => trace.type === activeTab.value);
   return [...filtered].sort((a, b) => tracePage(a) - tracePage(b) || b.createdAt.localeCompare(a.createdAt));
 });
 
@@ -103,17 +132,11 @@ function canEditReflection(reflection: Reflection): boolean {
 }
 
 async function loadAllTraces(id: string): Promise<Trace[]> {
-  const all: Trace[] = [];
-  let page = 1;
-  let total = 0;
-  do {
-    const params = new URLSearchParams({ page: String(page), pageSize: '100' });
-    const result = await booksApi.traces(id, params);
-    all.push(...result.items);
-    total = result.pagination.total;
-    page += 1;
-  } while (all.length < total && page <= 100);
-  return all;
+  // 按 id 去重的全量拉取：翻页期间若列表有新增，相邻页会重复一行，
+  // 去重后继续翻到唯一数量达到最新 total，避免把新记录漏在页边界外。
+  return fetchAllPages<Trace>((page, pageSize) =>
+    booksApi.traces(id, new URLSearchParams({ page: String(page), pageSize: String(pageSize) }))
+  );
 }
 
 async function load(): Promise<void> {
@@ -530,6 +553,50 @@ onMounted(load);
           </div>
         </article>
         <p v-if="activities.length === 0" class="empty-inline">这本书还没有变化记录。</p>
+      </div>
+
+      <div v-else-if="activeTab === 'REREAD_MARK'" class="reread-workspace">
+        <form class="reread-filter" @submit.prevent>
+          <label>
+            重读原因
+            <select v-model="rereadReasonFilter">
+              <option value="">全部原因</option>
+              <option v-if="hasEmptyRereadReason" :value="EMPTY_REASON">未填写原因</option>
+              <option v-for="reason in rereadReasonOptions" :key="reason" :value="reason">{{ reason }}</option>
+            </select>
+          </label>
+          <p class="muted reread-filter-count">
+            共 {{ filteredRereadCount }} 条重读 · {{ rereadGroups.length }} 个页面
+          </p>
+        </form>
+
+        <div v-if="rereadGroups.length > 0" class="reread-group-list">
+          <section v-for="group in rereadGroups" :key="group.pageNumber" class="reread-group">
+            <h3 class="reread-group-title">
+              第 {{ group.pageNumber }} 页
+              <span class="muted">· 共重读 {{ group.marks.length }} 次</span>
+            </h3>
+            <div class="trace-list">
+              <article v-for="mark in group.marks" :key="`REREAD_MARK-${mark.id}`" class="trace-card">
+                <div class="trace-card-heading">
+                  <div>
+                    <span class="trace-type">第 {{ mark.round }} 次重读</span>
+                    <strong>第 {{ mark.pageNumber }} 页</strong>
+                  </div>
+                  <div class="button-row">
+                    <button class="text-button" type="button" @click="openEdit(mark)">编辑</button>
+                    <button class="text-button danger-text" type="button" @click="deleteTrace(mark)">删除</button>
+                  </div>
+                </div>
+                <p class="preserve-text">{{ mark.reason || '未填写原因' }}</p>
+                <p class="muted">创建 {{ formatDateTime(mark.createdAt) }} · 更新 {{ formatDateTime(mark.updatedAt) }}</p>
+              </article>
+            </div>
+          </section>
+        </div>
+        <p v-else class="empty-inline">
+          {{ rereadReasonFilter ? '没有符合该原因的重读记录。' : '这个分类还没有留下痕迹。' }}
+        </p>
       </div>
 
       <div v-else class="trace-list">

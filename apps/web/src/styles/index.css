@@ -692,6 +692,39 @@ small,
   gap: 0.8rem;
 }
 
+.reread-workspace {
+  display: grid;
+  gap: 1rem;
+}
+
+.reread-filter {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: end;
+  justify-content: space-between;
+  gap: 0.8rem;
+}
+
+.reread-filter label {
+  flex: 1 1 220px;
+  max-width: 320px;
+}
+
+.reread-filter-count {
+  margin: 0;
+  font-size: 0.88rem;
+}
+
+.reread-group-list {
+  display: grid;
+  gap: 1.1rem;
+}
+
+.reread-group-title {
+  margin-bottom: 0.55rem;
+  font-size: 1.02rem;
+}
+
 .trace-card {
   border: 1px solid var(--line);
   border-radius: 14px;
